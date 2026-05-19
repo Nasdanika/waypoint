@@ -27,7 +27,7 @@ Originally this was scoped to graph traversal and was going to live alongside `o
 | HTTP server request flow  | Filter / handler                | Auth context, MDC               |
 | NSML mapping execution    | `(EObject source, MappingRule)` | `MappingContext`                |
 
-A single, structure-agnostic vocabulary - token, commit, merge, state, realm, telemetry - covers all of these, and lets specialized engines (OpGraph runtime, NSML mapping engine, EMF traversal, file walkers) compose freely with the same primitives.
+A single, structure-agnostic vocabulary - token, commit, merge, state, realm, telemetry - covers all of these, and lets specialized engines (OpGraph runtime, [NSML](https://github.com/Nasdanika-Models/nasdanika-semantic-mapping-language/blob/main/README.md) mapping engine, EMF traversal, file walkers) compose freely with the same primitives.
 
 ## 3. Prior art and positioning
 
@@ -507,7 +507,7 @@ Adapters for `org.nasdanika.graph`. Generic `Element` (node/connection) is the n
 
 ## 11. Mapping and transformation case study
 
-A worked example tying the module together, and the reason `org.nasdanika.token.nsml` (and an analogous integration into NSML itself) is on the roadmap. The companion document [NSML Execution Semantics - Tokens as the Runtime Substrate](./nsml-execution-with-tokens.md) covers the same material from the NSML side.
+A worked example tying the module together, and the reason `org.nasdanika.token.nsml` (and an analogous integration into NSML itself) is on the roadmap. 
 
 NSML - the Nasdanika Semantic Mapping Language - describes transformations from source models to target/semantic models via rules. An execution of an NSML mapping is a traversal of the source structure that produces target structure. Each rule firing is an execution step. The fit with tokens is direct.
 
