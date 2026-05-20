@@ -1,16 +1,18 @@
-# Token Module - Design Document
+# Waypoint Module — Design Document
 
 ## 1. Overview
 
-This document specifies a new Nasdanika module - **`org.nasdanika.token`** - providing a generic abstraction for tracking the lineage and payload of an execution as it advances through some structure: a graph, a file system, an EMF model, an AST, a state machine. A `Token` records *where* execution is, *how it got there*, *what data it carries*, and - for richer variants - *which editing domain it runs against* and *which OpenTelemetry span scopes it*.
+This document specifies a new Nasdanika module — **`org.nasdanika.waypoint`** — providing a generic abstraction for tracking the lineage and payload of an execution as it advances through some structure: a graph, a file system, an EMF model, an AST, a state machine. A `Waypoint` records *where* execution is, *how it got there*, *what data it carries*, and — for richer variants — *which realm it runs against* and *which OpenTelemetry span scopes it*.
 
 The model is inspired by three complementary precedents:
 
-- * Workflow/process engine tokens, which carry payload along a process and support rollback / retry through transaction groups.
+- Workflow / process engine tokens, which carry payload along a process and support rollback / retry through transaction groups.
 - **Git** commit history (immutable, parents, fast-forward, merge, reset).
 - **Petri-net tokens** and classical workflow semantics.
 
 Originally this was scoped to graph traversal and was going to live alongside `org.nasdanika.graph.message`. On reflection, the abstraction has no inherent dependency on graphs and warrants its own module.
+
+The module also absorbs `Realm`, `ExclusiveRealm`, and `ReadWriteRealm` — interfaces previously in `org.nasdanika.common`. They belong with the waypoint abstraction they serve (see §6.3) and are independently useful for any client that needs a guarded, command-accessed state without lineage.
 
 ## 2. Motivation
 
@@ -27,52 +29,52 @@ Originally this was scoped to graph traversal and was going to live alongside `o
 | HTTP server request flow  | Filter / handler                | Auth context, MDC               |
 | NSML mapping execution    | `(EObject source, MappingRule)` | `MappingContext`                |
 
-A single, structure-agnostic vocabulary - token, commit, merge, state, realm, telemetry - covers all of these, and lets specialized engines (OpGraph runtime, [NSML](https://github.com/Nasdanika-Models/nasdanika-semantic-mapping-language/blob/main/README.md) mapping engine, EMF traversal, file walkers) compose freely with the same primitives.
+A single, structure-agnostic vocabulary — waypoint, commit, merge, state, realm, telemetry — covers all of these, and lets specialized engines (OpGraph runtime, [NSML](https://github.com/Nasdanika-Models/nasdanika-semantic-mapping-language/blob/main/README.md) mapping engine, EMF traversal, file walkers) compose freely with the same primitives.
 
 ## 3. Prior art and positioning
 
-The token API draws on - and in places deliberately doesn't replicate - several existing bodies of work. This section surveys the landscape and explains why the module exists as a separate thing rather than building on one of the alternatives.
+The waypoint API draws on — and in places deliberately doesn't replicate — several existing bodies of work. This section surveys the landscape and explains why the module exists as a separate thing rather than building on one of the alternatives.
 
 ### 3.1 Survey
 
-**Workflow / process-engine tokens.** - Camunda, Flowable, and Activiti model a running BPMN process as a tree of `Execution` objects: each execution has a parent, a position (an `ActivityImpl`), local variables, and a lifecycle. jBPM predates them. Temporal (ex-Cadence) takes the same shape into a durable, replayable workflow execution - each `WorkflowExecution` has a complete event history that is essentially our token lineage promoted to a persistent first-class artifact. Apache Airflow's task instances are similar, but the DAG structure is rigid.
+**Workflow / process-engine tokens.** Camunda, Flowable, and Activiti model a running BPMN process as a tree of `Execution` objects: each execution has a parent, a position (an `ActivityImpl`), local variables, and a lifecycle. jBPM predates them. Temporal (ex-Cadence) takes the same shape into a durable, replayable workflow execution — each `WorkflowExecution` has a complete event history that is essentially our waypoint lineage promoted to a persistent first-class artifact. Apache Airflow's task instances are similar, but the DAG structure is rigid.
 
-**AI-era state graphs.** LangGraph's `StateGraph` carries a typed `State` through nodes, supports sync and async node bodies, has a checkpointer (persistent state), interrupts (pause/resume), conditional edges, and parallel branches with state merging. It is essentially `StateToken<Node, State>` with merge semantics, implemented in Python, bound to its own graph structure. Microsoft Semantic Kernel's Process Framework is converging on the same shape. CrewAI and AutoGen carry context less explicitly.
+**AI-era state graphs.** LangGraph's `StateGraph` carries a typed `State` through nodes, supports sync and async node bodies, has a checkpointer (persistent state), interrupts (pause/resume), conditional edges, and parallel branches with state merging. It is essentially `StateWaypoint<Node, State>` with merge semantics, implemented in Python, bound to its own graph structure. Microsoft Semantic Kernel's Process Framework is converging on the same shape. CrewAI and AutoGen carry context less explicitly.
 
-**Observability / context propagation.** Project Reactor's `Context` is the immutable-threaded-state piece, but has no lineage - it's a leaf in your chain, not a tree. Micrometer `Observation` is much closer to `TelemetryToken`: explicit parent/child, scopes, handlers, designed to wrap arbitrary execution. OpenTelemetry's `Span` does most of `TelemetryToken`'s job; our interface is a thin adapter. SLF4J MDC is mutable thread-local with no lineage.
+**Observability / context propagation.** Project Reactor's `Context` is the immutable-threaded-state piece, but has no lineage — it's a leaf in your chain, not a tree. Micrometer `Observation` is much closer to `TelemetryWaypoint`: explicit parent/child, scopes, handlers, designed to wrap arbitrary execution. OpenTelemetry's `Span` does most of `TelemetryWaypoint`'s job; our interface is a thin adapter. SLF4J MDC is mutable thread-local with no lineage.
 
-**Functional state threading.** The State monad in Vavr (Java), Cyclops (Java), Arrow (Kotlin), Cats (Scala). `StateToken#map` is a State-monad bind extended with branching. None of these pairs state threading with execution-position tracking or telemetry, because they are language-level rather than domain-level abstractions.
+**Functional state threading.** The State monad in Vavr (Java), Cyclops (Java), Arrow (Kotlin), Cats (Scala). `StateWaypoint#map` is a State-monad bind extended with branching. None of these pairs state threading with execution-position tracking or telemetry, because they are language-level rather than domain-level abstractions.
 
-**Content-addressed history.** jGit, Pijul, Mercurial. Event-sourcing frameworks - Axon, EventStoreDB - express the same idea as causation and correlation IDs on events.
+**Content-addressed history.** jGit, Pijul, Mercurial. Event-sourcing frameworks — Axon, EventStoreDB — express the same idea as causation and correlation IDs on events.
 
 **Specifications.** JSR 352 (Java Batch) `StepContext`, checkpoint, restart. JTA savepoints. Older but the rollback semantics map directly.
 
 ### 3.2 What we reuse rather than reinvent
 
-- **OpenTelemetry `Span` / `Context`.** `TelemetryToken` is a thin adapter, not a parallel telemetry system. The `org.nasdanika.token.telemetry` submodule is the only place this matters.
-- **Micrometer `Observation`.** An alternative `TelemetryToken` backend for Spring-adjacent consumers - adds nothing to the core module.
-- **Reactor `Context`.** We *carry* tokens through reactive pipelines using it; we do not replicate it.
+- **OpenTelemetry `Span` / `Context`.** `TelemetryWaypoint` is a thin adapter, not a parallel telemetry system. The `org.nasdanika.waypoint.telemetry` submodule is the only place this matters.
+- **Micrometer `Observation`.** An alternative `TelemetryWaypoint` backend for Spring-adjacent consumers — adds nothing to the core module.
+- **Reactor `Context`.** We *carry* waypoints through reactive pipelines using it; we do not replicate it.
 
 ### 3.3 Why a separate module rather than adopting an existing system
 
-- **Generic over the position type `E`.** Every existing system fixes the position type - BPMN activity, Airflow task, LangGraph node, Temporal workflow. None lets the consumer say "my position is a `Path`," or "my position is an `EObject` plus the `EReference` we traversed". That is the central novelty, and it's the property that lets one set of primitives serve OpGraph, NSML, EMF traversal, and file walks alike.
+- **Generic over the position type `E`.** Every existing system fixes the position type — BPMN activity, Airflow task, LangGraph node, Temporal workflow. None lets the consumer say "my position is a `Path`," or "my position is an `EObject` plus the `EReference` we traversed". That is the central novelty, and it's the property that lets one set of primitives serve OpGraph, NSML, EMF traversal, and file walks alike.
 - **Composable facets.** State, realm, telemetry as orthogonal mixins. Existing systems either bake everything into a monolithic execution object (Camunda `ExecutionEntity`, Temporal workflow handle) or split telemetry off entirely (OpenTelemetry separate from business logic). Neither makes it easy to choose your set of facets per use case.
-- **Library, not runtime.** Camunda, Temporal, LangGraph are runtimes - you cede control to their engine. Token is a library - the engine you build calls into it. This matches OpGraph's positioning: you embed it; it doesn't embed you.
+- **Library, not runtime.** Camunda, Temporal, LangGraph are runtimes — you cede control to their engine. Waypoint is a library — the engine you build calls into it. This matches OpGraph's positioning: you embed it; it doesn't embed you.
 
 ### 3.4 Scope and positioning
 
-The contribution is in the *factoring* - structure-agnostic position, composable facets, reactive-streams-native primitives - not in any single primitive. That is enough to justify the module inside the Nasdanika orbit, where there is concrete downstream demand (OpGraph runtime, NSML execution, EMF traversal, file walks). It is probably *not* enough to justify the module as a standalone library competing for adoption against Micrometer, LangGraph, and Temporal. The published module aims to be useful to anyone who happens to need its shape; it does not chase ecosystem competition.
+The contribution is in the *factoring* — structure-agnostic position, composable facets, reactive-streams-native primitives — not in any single primitive. That is enough to justify the module inside the Nasdanika orbit, where there is concrete downstream demand (OpGraph runtime, NSML execution, EMF traversal, file walks). It is probably *not* enough to justify the module as a standalone library competing for adoption against Micrometer, LangGraph, and Temporal. The published module aims to be useful to anyone who happens to need its shape; it does not chase ecosystem competition.
 
 ## 4. Module Layout
 
 ```
-org.nasdanika.token                       (core - this document)
-org.nasdanika.token.telemetry              (OpenTelemetry integration)
-org.nasdanika.token.git                    (jGit-backed history persistence)
-org.nasdanika.token.emf                    (ResourceSet-backed state, change recording)
-org.nasdanika.token.emf.transaction        (EMF Transaction-based RealmToken)
-org.nasdanika.token.graph                  (Adapters for org.nasdanika.graph)
-org.nasdanika.token.nsml                   (NSML mapping execution - see -11)
+org.nasdanika.waypoint                       (core — this document)
+org.nasdanika.waypoint.telemetry              (OpenTelemetry integration)
+org.nasdanika.waypoint.git                    (jGit-backed history persistence)
+org.nasdanika.waypoint.emf                    (ResourceSet-backed state, change recording)
+org.nasdanika.waypoint.emf.transaction        (EMF Transaction-based RealmWaypoint)
+org.nasdanika.waypoint.graph                  (Adapters for org.nasdanika.graph)
+org.nasdanika.waypoint.nsml                   (NSML mapping execution — see §11)
 ```
 
 Core depends only on the JDK, `org.reactivestreams`, and `reactor-core` (for `Mono` / `Flux`). Every other technology lives in an optional submodule so that downstream consumers pay only for what they use.
@@ -87,29 +89,35 @@ Method and type names borrow from jGit and from `java.util.stream` deliberately.
 | One parent by index  | `getParent(int)`           | `getParent(int)`            | `RevCommit#getParent(int)`.                                     |
 | Parent count         | `getParentCount()`         | `getParentCount()`          | `RevCommit#getParentCount()`.                                   |
 | Successor commits    | computed via `RevWalk`     | `getChildren()` (opt-in)    | Git doesn't store children; forward traversal here needs them.  |
-| Element / position   | (n/a)                      | `getElement()`              | Structural payload - node, file, EObject.                       |
+| Element / position   | (n/a)                      | `getElement()`              | Structural payload — node, file, EObject.                       |
 | Append (1 parent)    | `CommitBuilder.commit()`   | `commit(E)`                 | Verb form, mirrors Git fast-forward.                            |
 | Append (n parents)   | merge commit               | `merge(E, parents)`         | Same verb as Git merge.                                         |
-| Identity             | `getId()` ? `ObjectId`     | `getId()` (optional)        | For correlation, persistence, equality.                         |
+| Identity             | `getId()` → `ObjectId`     | `getId()` (optional)        | For correlation, persistence, equality.                         |
 
 The draft's `createChild(...)` is replaced by the two verbs `commit` and `merge`. They carry the Git mental model intact and avoid the noun-y, structure-irrelevant "child".
 
+### 5.1 Sync and async on the same interface
+
+Every interface in this module exposes both synchronous and asynchronous variants of the same operation. The async variant returns a cold `Mono` (Project Reactor), suffixed `Async`: `execute` / `executeAsync`, `apply` / `applyAsync`, `commit` / `commitAsync` (where applicable), `adapt` / `adaptAsync`. This mirrors the Azure OpenAI Java SDK convention and several other contemporary Java APIs — one interface, two modalities. Callers pick the modality at the call site; implementations are free to share code between them.
+
+The principle: *if an operation can be expressed in both modalities, it should be.* The waypoint module never forces async-only or sync-only on a caller.
+
 ## 6. Core interfaces
 
-### 6.1 `Token<E>`
+### 6.1 `Waypoint<E>`
 
 ```java
-public interface Token<E> {
+public interface Waypoint<E> {
 
-    /** The element this token records execution at. */
+    /** The element this waypoint records execution at. */
     E getElement();
 
     /**
-     * Parents of this token in creation order. Empty list iff this is a
-     * root token. Single-element list for linear progressions, multiple
+     * Parents of this waypoint in creation order. Empty list iff this is a
+     * root waypoint. Single-element list for linear progressions, multiple
      * elements for joins / merges.
      */
-    List<? extends Token<E>> getParents();
+    List<? extends Waypoint<E>> getParents();
 
     /** Equivalent to {@code getParents().size()}. Matches jGit. */
     default int getParentCount() {
@@ -117,126 +125,120 @@ public interface Token<E> {
     }
 
     /** Parent at index {@code n}. Matches jGit. */
-    default Token<E> getParent(int n) {
+    default Waypoint<E> getParent(int n) {
         return getParents().get(n);
     }
 
     /**
-     * Children of this token. May be empty if the implementation does
-     * not track children (which is the default - see -14 Open Questions).
+     * Children of this waypoint. May be empty if the implementation does
+     * not track children (which is the default — see §14 Open Questions).
      * Unlike Git commits, we expose children because the typical
      * traversal-time use case reads them forward.
      */
-    Collection<? extends Token<E>> getChildren();
+    Collection<? extends Waypoint<E>> getChildren();
 
     /** Single-parent (fast-forward) descendant. */
-    Token<E> commit(E next);
+    Waypoint<E> commit(E next);
 
     /**
      * Multi-parent (merge) descendant. {@code this} is the first parent;
      * {@code additionalParents} follow in iteration order.
      *
-     * @param next               element of the new token
+     * @param next               element of the new waypoint
      * @param additionalParents  joining parents, may be empty
      */
-    Token<E> merge(E next, Iterable<? extends Token<E>> additionalParents);
+    Waypoint<E> merge(E next, Iterable<? extends Waypoint<E>> additionalParents);
 
     /**
      * Varargs convenience over {@link #merge(Object, Iterable)}.
-     * See -7 for the varargs/generics caveat.
+     * See §7 for the varargs/generics caveat.
      */
     @SuppressWarnings({"unchecked", "varargs"})
-    default Token<E> merge(E next, Token<E>... additionalParents) {
+    default Waypoint<E> merge(E next, Waypoint<E>... additionalParents) {
         return merge(next, Arrays.asList(additionalParents));
     }
 }
 ```
 
-### 6.2 `StateToken<E, S>`
+### 6.2 `StateWaypoint<E, S>`
 
-Adds a state value of type `S`. State is read-only from the token's perspective; transformations produce *new* tokens. This matches reactive-streams / functional style - tokens are values, not mutable cells. (The escape hatch for genuinely mutable state is `RealmToken`, -6.3.)
+Adds a state value of type `S`. State is read-only from the waypoint's perspective; transformations produce *new* waypoints. This matches reactive-streams / functional style — waypoints are values, not mutable cells. (The escape hatch for genuinely mutable state is `RealmWaypoint`, §6.4.)
 
 ```java
-public interface StateToken<E, S> extends Token<E> {
+public interface StateWaypoint<E, S> extends Waypoint<E> {
 
-    /** The state value carried by this token. */
+    /** The state value carried by this waypoint. */
     S getState();
 
-    // -- Narrowed returns --------------------------------------------
+    // ── Narrowed returns ─────────────────────────────────────────────
 
     @Override
-    List<? extends StateToken<E, ?>> getParents();
+    List<? extends StateWaypoint<E, ?>> getParents();
 
     @Override
-    Collection<? extends StateToken<E, ?>> getChildren();
+    Collection<? extends StateWaypoint<E, ?>> getChildren();
 
-    /**
-     * Fast-forward that propagates the current state unchanged.
-     */
+    /** Fast-forward that propagates the current state unchanged. */
     @Override
-    default StateToken<E, S> commit(E next) {
+    default StateWaypoint<E, S> commit(E next) {
         return commit(next, getState());
     }
 
     /**
      * Note: Java doesn't allow widening parameter types on override,
-     * so the inherited {@code merge(E, Iterable<? extends Token<E>>)}
+     * so the inherited {@code merge(E, Iterable<? extends Waypoint<E>>)}
      * stays with that signature. Implementations check parents are
-     * {@code StateToken} at runtime if needed.
+     * {@code StateWaypoint} at runtime if needed.
      */
     @Override
-    StateToken<E, S> merge(E next, Iterable<? extends Token<E>> additionalParents);
+    StateWaypoint<E, S> merge(E next, Iterable<? extends Waypoint<E>> additionalParents);
 
-    // -- State-aware factories ---------------------------------------
+    // ── State-aware factories ────────────────────────────────────────
 
     /** Fast-forward with a new state. */
-    <T> StateToken<E, T> commit(E next, T nextState);
+    <T> StateWaypoint<E, T> commit(E next, T nextState);
 
     /** Merge with an explicit new state. */
-    <T> StateToken<E, T> merge(
+    <T> StateWaypoint<E, T> merge(
             E next,
             T nextState,
-            Iterable<? extends StateToken<E, ?>> additionalParents);
+            Iterable<? extends StateWaypoint<E, ?>> additionalParents);
 
-    // -- Mapping -----------------------------------------------------
+    // ── Mapping ──────────────────────────────────────────────────────
 
     /**
-     * Compute the next state from this token and joining parents,
+     * Compute the next state from this waypoint and joining parents,
      * synchronously, on the calling thread.
      *
      * The list passed to the mapper has {@code this} as element 0;
      * joining parents follow in iteration order.
-     *
-     * @param next                element of the resulting token
-     * @param mapper              produces the next state
-     * @param additionalParents   joining parents, may be empty
      */
-    <T> StateToken<E, T> map(
+    <T> StateWaypoint<E, T> map(
             E next,
-            Function<? super List<? extends StateToken<E, ?>>, ? extends T> mapper,
-            Iterable<? extends StateToken<E, ?>> additionalParents);
+            Function<? super List<? extends StateWaypoint<E, ?>>, ? extends T> mapper,
+            Iterable<? extends StateWaypoint<E, ?>> additionalParents);
 
     /**
      * Asynchronous counterpart of {@link #map}. The mapper returns a
-     * {@code Mono<T>}; the result is a {@code Mono<StateToken<E,T>>}.
-     * The created token is not visible to observers until the mono
-     * emits.
+     * {@code Mono<T>}; the result is a {@code Mono<StateWaypoint<E,T>>}.
      */
-    <T> Mono<StateToken<E, T>> mapAsync(
+    <T> Mono<StateWaypoint<E, T>> mapAsync(
             E next,
-            Function<? super List<? extends StateToken<E, ?>>, ? extends Mono<T>> mapper,
-            Iterable<? extends StateToken<E, ?>> additionalParents);
+            Function<? super List<? extends StateWaypoint<E, ?>>, ? extends Mono<T>> mapper,
+            Iterable<? extends StateWaypoint<E, ?>> additionalParents);
 }
 ```
 
 Notes:
 
-- Mapper signatures use PECS variance (`? super X`, `? extends Y`) - same convention as `Stream#map`, `Stream#collect`, `Collectors`.
+- Mapper signatures use PECS variance (`? super X`, `? extends Y`) — same convention as `Stream#map`, `Stream#collect`, `Collectors`.
 - Async returns are `Mono` / `Mono<Void>`, never `CompletionStage`. Adapters can be added later via `Mono#toFuture` / `Mono.fromFuture`.
 
-### 6.3 `RealmToken<E, S>`
+### 6.3 The Realm family
 
-For state that *cannot* be propagated by value: an `EditingDomain`, a JDBC `Connection`, a `Repository`, an event-loop `Context`, a JFace `Realm`. Clients don't manipulate the state directly - they submit **commands** that execute against it inside the realm's invariants (synchronization, transactions, undo recording).
+For state that *cannot* be propagated by value: an `EditingDomain`, a JDBC `Connection`, a `Repository`, an event-loop `Context`, a JFace `Realm`. Clients don't manipulate the state directly — they submit **commands** that execute against it inside the realm's invariants (synchronization, transactions, undo recording).
+
+A `Realm<S>` is a bounded space of state whose invariants — threading, transactions, undo — require that access go through commands rather than direct mutation. The interface is freestanding (it has clients that need a guarded space without lineage) and `RealmWaypoint<E, S>` extends it (§6.4).
 
 The mental model mirrors:
 
@@ -244,65 +246,178 @@ The mental model mirrors:
 - `EditingDomain.getCommandStack().execute(Command)`.
 - `Vertx.runOnContext` / `Context.runOnContext`.
 
+These three interfaces — `Realm`, `ExclusiveRealm`, `ReadWriteRealm` — move into the waypoint module from `org.nasdanika.common`, where they were experimental. They are consolidated here because that is where their primary client (`RealmWaypoint`) lives, and because `org.nasdanika.common` should remain minimal.
+
+#### 6.3.1 `Realm<S>`
+
 ```java
-public interface RealmToken<E, S> extends Token<E> {
+public interface Realm<S> {
 
-    @Override
-    List<? extends RealmToken<E, S>> getParents();
+    /** Run a command against the guarded state; returns when the command completes. */
+    void execute(Consumer<? super S> command);
 
-    @Override
-    Collection<? extends RealmToken<E, S>> getChildren();
+    /** Asynchronous {@link #execute}. */
+    Mono<Void> executeAsync(Consumer<? super S> command);
 
-    @Override
-    RealmToken<E, S> commit(E next);
-
-    @Override
-    RealmToken<E, S> merge(E next, Iterable<? extends Token<E>> additionalParents);
+    /** Compute a value from the guarded state. */
+    <T> T apply(Function<? super S, ? extends T> command);
 
     /**
-     * Execute a command against the realm-managed state synchronously.
-     * The token is passed so the command can issue further commits;
-     * the state is passed for direct manipulation. Returns when the
-     * command has completed.
+     * Asynchronous {@link #apply}. The command returns a {@code Mono<T>};
+     * the realm flattens it. Same shape as {@code Mono#flatMap}.
      */
-    void execute(BiConsumer<? super RealmToken<E, S>, ? super S> command);
+    <T> Mono<T> applyAsync(Function<? super S, ? extends Mono<T>> command);
 
-    /** Async {@link #execute}. */
-    Mono<Void> executeAsync(BiConsumer<? super RealmToken<E, S>, ? super S> command);
+    // ── Adaptation ───────────────────────────────────────────────────
 
-    /** Compute a value against the realm-managed state. */
-    <T> T apply(BiFunction<? super RealmToken<E, S>, ? super S, ? extends T> command);
+    /**
+     * View this realm as a {@code Realm<T>}. The adapter runs inside
+     * this realm on every command access — lens semantics, not snapshot.
+     * Construction is cheap; per-access cost is the adapter cost.
+     *
+     * The returned realm preserves this realm's threading and transaction
+     * discipline; it just substitutes T-shaped state for S-shaped.
+     */
+    <T> Realm<T> adapt(Function<? super S, ? extends T> adapter);
 
-    /** Async {@link #apply}, flattening the resulting {@code Mono}. */
-    <T> Mono<T> applyAsync(
-            BiFunction<? super RealmToken<E, S>, ? super S, ? extends Mono<T>> command);
+    /**
+     * Async-adapter variant. The adapter runs once asynchronously; the
+     * resulting {@code Realm<T>} wraps the produced T as a snapshot.
+     * Snapshot rather than lens because re-running an async adapter on
+     * every command access is rarely what callers want; if you do want
+     * that, write a {@link #adapt} that delegates to a sync helper which
+     * blocks on the async source.
+     */
+    <T> Mono<Realm<T>> adaptAsync(Function<? super S, ? extends Mono<T>> adapter);
 }
 ```
 
-#### Should `RealmToken` extend `StateToken`?
+The `Function<? super S, ? extends T>` / `Function<? super S, ? extends Mono<T>>` adapter type is intentionally general. The adapter can be a field selection, a projection, an NSML transformation, an OpGraph mapping, an AI-agent invocation that supplies semantic context, or any composition of these. The most consequential use case — *NSML transformations as adapters* — is worked out in §11.6, because it is what makes `Realm` and `Waypoint` more than independent abstractions sharing a module: they enable each other's most interesting compositions. Sync `adapt` suits cheap deterministic adapters; async `adaptAsync` suits expensive or AI-driven ones where snapshot semantics are correct.
 
-It has state. But clients aren't expected to call `getState()` directly - they go through `execute` / `apply` to respect the realm's threading and transaction rules. Reading state outside a command can be unsafe.
-
-**Recommendation:** keep them as siblings. Provide a combined interface `RealmStateToken<E, S>` for the cases where direct state read is *also* safe (immutable snapshot state, for instance). This keeps the API honest about thread-safety; clients that genuinely want both opt in by typing against the combined interface.
-
-### 6.4 `TelemetryToken<E>`
-
-Wraps an OpenTelemetry `Span` and `Context`. Each `commit` / `merge` corresponds to a child span; `close()` ends the span. The token is `AutoCloseable` so it works in try-with-resources.
+#### 6.3.2 `ExclusiveRealm<S>`
 
 ```java
-public interface TelemetryToken<E> extends Token<E>, AutoCloseable {
+public interface ExclusiveRealm<S> extends Realm<S> {
+
+    /*
+     * Refinement of Realm with single-concurrent semantics: at most one
+     * execute or apply (sync or async) is in-flight at a time. Subsequent
+     * operations queue until the in-flight one completes.
+     *
+     * No additional methods are required for the basic contract; the
+     * type carries the semantics. Implementations may add a
+     * {@code tryExecute} / {@code tryApply} pair for non-blocking
+     * attempts, and a {@code Disposable} hook for cancellation —
+     * deferred to follow-up.
+     */
 
     @Override
-    List<? extends TelemetryToken<E>> getParents();
+    <T> ExclusiveRealm<T> adapt(Function<? super S, ? extends T> adapter);
+
+    // adaptAsync inherited; returns Mono<Realm<T>>. The async snapshot
+    // does not need exclusive semantics by default. A caller who wants
+    // an exclusive snapshot can wrap the resulting Realm<T> via a small
+    // utility (Realms.exclusive(Realm<T>)) — TBD.
+}
+```
+
+#### 6.3.3 `ReadWriteRealm<S>`
+
+```java
+public interface ReadWriteRealm<S> {
+
+    /*
+     * Does NOT extend Realm. Clients route reads and writes explicitly
+     * via getReadRealm() / getWriteRealm(); the type itself does not
+     * expose execute/apply directly. This makes the read/write contract
+     * visible in the type system, in the spirit of
+     * java.util.concurrent.locks.ReentrantReadWriteLock and EMF
+     * Transaction's read/write distinction.
+     */
+
+    /**
+     * View for shared concurrent reads. Multiple read operations may run
+     * concurrently; reads block while a write is in progress.
+     */
+    Realm<S> getReadRealm();
+
+    /**
+     * View for exclusive writes. Writes serialize against each other and
+     * against in-flight reads.
+     */
+    ExclusiveRealm<S> getWriteRealm();
+
+    // ── Adaptation ───────────────────────────────────────────────────
+
+    /**
+     * Adapt to a {@code ReadWriteRealm<T>}. Reads and writes on the
+     * adapted realm apply the adapter inside the corresponding view of
+     * the underlying realm — lens semantics, preserved across read and
+     * write.
+     */
+    <T> ReadWriteRealm<T> adapt(Function<? super S, ? extends T> adapter);
+
+    /** Async-adapter variant — snapshot semantics, see {@link Realm#adaptAsync}. */
+    <T> Mono<ReadWriteRealm<T>> adaptAsync(Function<? super S, ? extends Mono<T>> adapter);
+}
+```
+
+A `ReadWriteRealm<S>` is *not* a `Realm<S>`. The reason is honesty: when a caller has a `Realm<S>` reference they don't know whether the operation they're about to issue is a read or a write, and the realm has no way to route it correctly. Forcing the caller to ask for `getReadRealm()` or `getWriteRealm()` puts the right knowledge at the right place.
+
+### 6.4 `RealmWaypoint<E, S>`
+
+A waypoint over a realm-managed state. Realm methods are inherited; no new methods are needed beyond the narrowed Waypoint returns.
+
+```java
+public interface RealmWaypoint<E, S> extends Waypoint<E>, Realm<S> {
 
     @Override
-    Collection<? extends TelemetryToken<E>> getChildren();
+    List<? extends RealmWaypoint<E, S>> getParents();
 
     @Override
-    TelemetryToken<E> commit(E next);
+    Collection<? extends RealmWaypoint<E, S>> getChildren();
 
     @Override
-    TelemetryToken<E> merge(E next, Iterable<? extends Token<E>> additionalParents);
+    RealmWaypoint<E, S> commit(E next);
+
+    @Override
+    RealmWaypoint<E, S> merge(E next, Iterable<? extends Waypoint<E>> additionalParents);
+
+    // execute, executeAsync, apply, applyAsync, adapt, adaptAsync
+    // inherited from Realm<S>. Closure-capture of the waypoint inside
+    // the command body removes any need for BiConsumer<Waypoint, S>
+    // ergonomic overloads — callers write
+    //     wp.execute(state -> doStuff(wp, state));
+    // and the compiler does the right thing.
+}
+```
+
+A draft of `RealmWaypoint` had `execute(BiConsumer<RealmWaypoint<E,S>, S>)` etc. — passing both waypoint and state explicitly. That's not needed once `Realm` is its own interface: the caller's closure captures the waypoint reference. The simpler signatures inherited from `Realm` are sufficient.
+
+#### Should `RealmWaypoint` extend `StateWaypoint`?
+
+It has state. But clients aren't expected to call `getState()` directly — they go through `execute` / `apply` to respect the realm's threading and transaction rules. Reading state outside a command can be unsafe.
+
+**Recommendation:** keep them as siblings. Provide a combined interface `RealmStateWaypoint<E, S>` for the cases where direct state read is *also* safe (immutable snapshot state, for instance). This keeps the API honest about thread-safety; clients that genuinely want both opt in by typing against the combined interface.
+
+### 6.5 `TelemetryWaypoint<E>`
+
+Wraps an OpenTelemetry `Span` and `Context`. Each `commit` / `merge` corresponds to a child span; `close()` ends the span. The waypoint is `AutoCloseable` so it works in try-with-resources.
+
+```java
+public interface TelemetryWaypoint<E> extends Waypoint<E>, AutoCloseable {
+
+    @Override
+    List<? extends TelemetryWaypoint<E>> getParents();
+
+    @Override
+    Collection<? extends TelemetryWaypoint<E>> getChildren();
+
+    @Override
+    TelemetryWaypoint<E> commit(E next);
+
+    @Override
+    TelemetryWaypoint<E> merge(E next, Iterable<? extends Waypoint<E>> additionalParents);
 
     /**
      * OpenTelemetry context for propagation across process boundaries
@@ -312,81 +427,78 @@ public interface TelemetryToken<E> extends Token<E>, AutoCloseable {
 
     /**
      * Tracer for instrumenting code that wants to create spans
-     * beneath this token's span without creating a child token.
+     * beneath this waypoint's span without creating a child waypoint.
      */
     Tracer getTracer();
 
-    /** Optional meter, for tokens that also scope metrics. */
+    /** Optional meter, for waypoints that also scope metrics. */
     Meter getMeter();
 
-    /**
-     * End the span associated with this token. Idempotent.
-     * Does not close children's spans.
-     */
+    /** End the span associated with this waypoint. Idempotent. */
     @Override
     void close();
 
-    /** Async close - when the span lifecycle ends with an async op. */
+    /** Async close — when the span lifecycle ends with an async op. */
     Mono<Void> closeAsync();
 
-    /** Run a command with this token's context activated. */
-    void execute(Consumer<? super TelemetryToken<E>> command);
+    /** Run a command with this waypoint's context activated. */
+    void execute(Consumer<? super TelemetryWaypoint<E>> command);
 
-    Mono<Void> executeAsync(Consumer<? super TelemetryToken<E>> command);
+    Mono<Void> executeAsync(Consumer<? super TelemetryWaypoint<E>> command);
 
-    <T> T apply(Function<? super TelemetryToken<E>, ? extends T> command);
+    <T> T apply(Function<? super TelemetryWaypoint<E>, ? extends T> command);
 
     <T> Mono<T> applyAsync(
-            Function<? super TelemetryToken<E>, ? extends Mono<T>> command);
+            Function<? super TelemetryWaypoint<E>, ? extends Mono<T>> command);
 }
 ```
 
-The `applyAsync` mapper returns `Mono<T>` and the method returns the flattened `Mono<T>` - the same shape as `Mono#flatMap`, avoiding an awkward `Mono<Mono<T>>`.
+The `applyAsync` mapper returns `Mono<T>` and the method returns the flattened `Mono<T>` — the same shape as `Mono#flatMap`, avoiding an awkward `Mono<Mono<T>>`.
 
 ## 7. Generic varargs
 
-The draft poses: *"will the compiler complain about generic varargs?"* Yes. `Token<E>... parents` produces an *"unchecked generic array creation for varargs parameter"* warning at every call site. `@SafeVarargs` requires the annotated method to be `final`, `static`, or `private` - none of which applies to a regular interface method. It *can* be applied to a `private` interface method in Java 9+, but not to a `default` one.
+`Waypoint<E>... parents` produces an *"unchecked generic array creation for varargs parameter"* warning at every call site. `@SafeVarargs` requires the annotated method to be `final`, `static`, or `private` — none of which applies to a regular interface method. It *can* be applied to a `private` interface method in Java 9+, but not to a `default` one.
 
 Options considered, in order of preference:
 
 1. **Drop the varargs from the interface entirely.** Only declare the `Iterable` overload. Callers use `List.of(a, b)` or `Set.of(a, b)`. Cleanest, most reactive-streams-style.
 2. **Keep a `default` varargs convenience method** that delegates to the `Iterable` overload, with `@SuppressWarnings({"unchecked","varargs"})` on the declaration. Call sites stay clean.
-3. **Static varargs factory in a `Tokens` utility class** that *is* `final` and *can* legally bear `@SafeVarargs`.
+3. **Static varargs factory in a `Waypoints` utility class** that *is* `final` and *can* legally bear `@SafeVarargs`.
 
-**Recommendation:** option 2 - pragmatic, idiomatic with `List.of` / `Stream.of`, and the warning is suppressed exactly once at the declaration site.
+**Recommendation:** option 2 — pragmatic, idiomatic with `List.of` / `Stream.of`, and the warning is suppressed exactly once at the declaration site.
 
 ## 8. Combinations of facets
 
-We need tokens that are both telemetric and stateful, or both telemetric and realm-bound. Two strategies, ship both.
+We need waypoints that are both telemetric and stateful, or both telemetric and realm-bound. Two strategies, ship both.
 
 ### 8.1 Composed interfaces (typed)
 
 ```java
-public interface TelemetryStateToken<E, S>
-        extends TelemetryToken<E>, StateToken<E, S> {
+public interface TelemetryStateWaypoint<E, S>
+        extends TelemetryWaypoint<E>, StateWaypoint<E, S> {
 
     @Override
-    List<? extends TelemetryStateToken<E, ?>> getParents();
+    List<? extends TelemetryStateWaypoint<E, ?>> getParents();
 
     @Override
-    TelemetryStateToken<E, S> commit(E next);
+    TelemetryStateWaypoint<E, S> commit(E next);
     // ...narrowed returns
 }
 
-public interface TelemetryRealmToken<E, S>
-        extends TelemetryToken<E>, RealmToken<E, S> { /* ... */ }
+public interface TelemetryRealmWaypoint<E, S>
+        extends TelemetryWaypoint<E>, RealmWaypoint<E, S> { /* ... */ }
 
-public interface RealmStateToken<E, S>
-        extends RealmToken<E, S>, StateToken<E, S> { /* ... */ }
+public interface RealmStateWaypoint<E, S>
+        extends RealmWaypoint<E, S>, StateWaypoint<E, S> { /* ... */ }
 ```
 
 Pro: single object, strong typing at call sites.
-Con: combinatorial growth when facets multiply (auth context, MDC, transaction handle, -). Bridge methods are needed to narrow return types, and default methods can clash between super-interfaces.
+Con: combinatorial growth when facets multiply (auth context, MDC, transaction handle, …). Bridge methods are needed to narrow return types, and default methods can clash between super-interfaces.
 
 ### 8.2 Facet pattern (open-ended)
 
 ```java
-public interface Token<E> {
+public interface Waypoint<E> {
     // ...
     default <F> Optional<F> facet(Class<F> facetType) {
         return Optional.empty();
@@ -394,95 +506,108 @@ public interface Token<E> {
 }
 
 // Usage:
-token.facet(TelemetryFacet.class)
+waypoint.facet(TelemetryFacet.class)
      .ifPresent(t -> t.span().addEvent("..."));
-token.facet(StateFacet.class)
+waypoint.facet(StateFacet.class)
      .ifPresent(s -> useState(s.value()));
 ```
 
-Pro: open-ended; aligns with Eclipse `IAdaptable` and EMF `EObject.eAdapters()` - both already used by Nasdanika.
+Pro: open-ended; aligns with Eclipse `IAdaptable` and EMF `EObject.eAdapters()` — both already used by Nasdanika.
 Con: less type-safe; needs explicit lookup.
 
-**Recommendation:** ship both. Composed interfaces cover the common cases with strong typing; `facet(...)` keeps `Token<E>` future-proof.
+**Recommendation:** ship both. Composed interfaces cover the common cases with strong typing; `facet(...)` keeps `Waypoint<E>` future-proof.
 
-## 9. Token factories
+## 9. Waypoint factories
 
-A `TokenFactory<E, T>` produces the root token(s) and encapsulates traversal-wide policy (child tracking on/off, threading model, telemetry hookups, -).
+A `WaypointFactory<E, W>` produces the root waypoint(s) and encapsulates traversal-wide policy (child tracking on/off, threading model, telemetry hookups, …).
 
 ```java
-public interface TokenFactory<E, T extends Token<E>> {
+public interface WaypointFactory<E, W extends Waypoint<E>> {
 
     /** New root with no parents. */
-    T root(E element);
+    W root(E element);
 
     /**
      * New root with the given parents. Useful for resuming a traversal
      * or splicing sub-traversals together.
      */
-    T root(E element, Iterable<? extends T> parents);
+    W root(E element, Iterable<? extends W> parents);
 }
 
-public interface StateTokenFactory<E, S>
-        extends TokenFactory<E, StateToken<E, S>> {
+public interface StateWaypointFactory<E, S>
+        extends WaypointFactory<E, StateWaypoint<E, S>> {
 
-    StateToken<E, S> root(E element, S initialState);
+    StateWaypoint<E, S> root(E element, S initialState);
 }
 
-public interface RealmTokenFactory<E, S>
-        extends TokenFactory<E, RealmToken<E, S>> { /* ... */ }
+public interface RealmWaypointFactory<E, S>
+        extends WaypointFactory<E, RealmWaypoint<E, S>> { /* ... */ }
 
-public interface TelemetryTokenFactory<E>
-        extends TokenFactory<E, TelemetryToken<E>> {
+public interface TelemetryWaypointFactory<E>
+        extends WaypointFactory<E, TelemetryWaypoint<E>> {
 
-    TelemetryToken<E> root(E element, Tracer tracer);
+    TelemetryWaypoint<E> root(E element, Tracer tracer);
 }
 ```
 
-A `Tokens` utility class hosts decorators and static helpers, and is the right place for `@SafeVarargs` static varargs methods (see -7):
+A `Waypoints` utility class hosts decorators and static helpers, and is the right place for `@SafeVarargs` static varargs methods (see §7):
 
 ```java
-public final class Tokens {
-    private Tokens() {}
+public final class Waypoints {
+    private Waypoints() {}
 
-    public static <E> TokenFactory<E, Token<E>> recording();
+    public static <E> WaypointFactory<E, Waypoint<E>> recording();
 
-    public static <E, S> StateTokenFactory<E, S> stateful();
+    public static <E, S> StateWaypointFactory<E, S> stateful();
 
-    public static <E, T extends Token<E>> TokenFactory<E, T> withChildTracking(
-            TokenFactory<E, T> delegate);
+    public static <E, W extends Waypoint<E>> WaypointFactory<E, W> withChildTracking(
+            WaypointFactory<E, W> delegate);
 
     @SafeVarargs
-    public static <E> List<Token<E>> parents(Token<E>... parents) {
+    public static <E> List<Waypoint<E>> parents(Waypoint<E>... parents) {
         return List.of(parents);
     }
 }
 ```
 
+A small companion utility class `Realms` is the equivalent for realm operations that need static helpers (e.g. an `exclusive(Realm<T>)` decorator that wraps a non-exclusive realm in an exclusive one):
+
+```java
+public final class Realms {
+    private Realms() {}
+
+    public static <S> ExclusiveRealm<S> exclusive(Realm<S> delegate);
+
+    public static <S> ReadWriteRealm<S> readWrite(
+            Realm<S> readView, ExclusiveRealm<S> writeView);
+}
+```
+
 ## 10. Technology-specific submodules
 
-### 10.1 `org.nasdanika.token.telemetry`
+### 10.1 `org.nasdanika.waypoint.telemetry`
 
-Reference `TelemetryToken` implementation backed by the OpenTelemetry SDK:
+Reference `TelemetryWaypoint` implementation backed by the OpenTelemetry SDK:
 
-- Span creation per `commit` / `merge`. Single-parent ? `Span.setParent`; multi-parent ? primary parent via `setParent`, joining parents via `Span.addLink`.
+- Span creation per `commit` / `merge`. Single-parent → `Span.setParent`; multi-parent → primary parent via `setParent`, joining parents via `Span.addLink`.
 - Context propagation across process boundaries via `TextMapPropagator`.
 - Optional `Meter` for metrics scoped to the span.
 
-### 10.2 `org.nasdanika.token.git`
+### 10.2 `org.nasdanika.waypoint.git`
 
-`GitToken<E, S>` persists each commit to a Git repository - element + state are serialized to blobs and recorded as a real `RevCommit`. Branches and merges happen at the jGit level. Use cases: durable execution history for long-running or replayable processes, rollback via `git reset` / `git revert`, forensic analysis.
+`GitWaypoint<E, S>` persists each commit to a Git repository — element + state are serialized to blobs and recorded as a real `RevCommit`. Branches and merges happen at the jGit level. Use cases: durable execution history for long-running or replayable processes, rollback via `git reset` / `git revert`, forensic analysis.
 
 ```java
-public interface GitToken<E, S> extends StateToken<E, S> {
+public interface GitWaypoint<E, S> extends StateWaypoint<E, S> {
     ObjectId getCommitId();
     RevCommit getCommit();
     Ref getBranch();
 }
 
-public final class GitTokenFactory<E, S>
-        implements StateTokenFactory<E, S> {
+public final class GitWaypointFactory<E, S>
+        implements StateWaypointFactory<E, S> {
 
-    public GitTokenFactory(
+    public GitWaypointFactory(
             Repository repository,
             String branch,
             Serializer<E> elementSerializer,
@@ -490,28 +615,28 @@ public final class GitTokenFactory<E, S>
 }
 ```
 
-### 10.3 `org.nasdanika.token.emf`
+### 10.3 `org.nasdanika.waypoint.emf`
 
 Bridges to EMF `ResourceSet` / `Resource`:
 
-- `ResourceSetStateToken<E>` - `S = ResourceSet`; child tokens see snapshots via copying.
-- `ChangeRecordingStateToken<E>` - wraps `org.eclipse.emf.ecore.change.util.ChangeRecorder`; each step records a `ChangeDescription` that can be applied forward or applied-inverse (rollback).
+- `ResourceSetStateWaypoint<E>` — `S = ResourceSet`; child waypoints see snapshots via copying.
+- `ChangeRecordingStateWaypoint<E>` — wraps `org.eclipse.emf.ecore.change.util.ChangeRecorder`; each step records a `ChangeDescription` that can be applied forward or applied-inverse (rollback).
 
-### 10.4 `org.nasdanika.token.emf.transaction`
+### 10.4 `org.nasdanika.waypoint.emf.transaction`
 
-Bridges to `org.eclipse.emf.transaction`. Commands issued via `RealmToken#execute` are wrapped in `RecordingCommand`s and pushed to the editing domain's command stack, so EMF undo/redo and write-locks work transparently.
+Bridges to `org.eclipse.emf.transaction`. Commands issued via `RealmWaypoint#execute` are wrapped in `RecordingCommand`s and pushed to the editing domain's command stack, so EMF undo/redo and write-locks work transparently. The EMF `TransactionalEditingDomain`'s read/write distinction maps naturally onto `ReadWriteRealm` (§6.3.3).
 
-### 10.5 `org.nasdanika.token.graph`
+### 10.5 `org.nasdanika.waypoint.graph`
 
 Adapters for `org.nasdanika.graph`. Generic `Element` (node/connection) is the natural `E`. This is the original OpGraph use case; it lives here rather than in core so the core module has no graph dependency.
 
 ## 11. Mapping and transformation case study
 
-A worked example tying the module together, and the reason `org.nasdanika.token.nsml` (and an analogous integration into NSML itself) is on the roadmap. 
+A worked example tying the module together, and the reason `org.nasdanika.waypoint.nsml` (and an analogous integration into NSML itself) is on the roadmap.
 
-NSML - the Nasdanika Semantic Mapping Language - describes transformations from source models to target/semantic models via rules. An execution of an NSML mapping is a traversal of the source structure that produces target structure. Each rule firing is an execution step. The fit with tokens is direct.
+NSML — the Nasdanika Semantic Mapping Language — describes transformations from source models to target/semantic models via rules. An execution of an NSML mapping is a traversal of the source structure that produces target structure. Each rule firing is an execution step. The fit with waypoints is direct.
 
-### 11.1 Mapping execution as tokens
+### 11.1 Mapping execution as waypoints
 
 **Position (`E`).** A `MappingStep` value combining the source element being mapped and the rule that fired:
 
@@ -519,50 +644,50 @@ NSML - the Nasdanika Semantic Mapping Language - describes transformations from 
 record MappingStep(EObject source, MappingRule rule) {}
 ```
 
-`E = MappingStep` gives the lineage immediate meaning - every token says "rule R was applied to source S."
+`E = MappingStep` gives the lineage immediate meaning — every waypoint says "rule R was applied to source S."
 
 **State (`S`).** A `MappingContext` holding:
 
 - The target `ResourceSet` being built.
-- A bindings map: source `EObject` ? target `EObject`(s).
+- A bindings map: source `EObject` → target `EObject`(s).
 - Accumulated diagnostics (errors, warnings, low-confidence flags from AI rules).
 - Source-tracing references for downstream provenance queries.
 
-In practice the mapping context is realm-managed - writes to the target `ResourceSet` go through commands - so `RealmStateToken<MappingStep, MappingContext>` is the right shape. Reading the bindings map for routing decisions is safe; writes go through `execute`.
+In practice the mapping context is realm-managed — writes to the target `ResourceSet` go through commands — so `RealmStateWaypoint<MappingStep, MappingContext>` is the right shape. Reading the bindings map for routing decisions is safe; writes go through `execute`.
 
-**Telemetry.** Each `commit` / `merge` is a span. Rule attributes go on the span: `nsml.rule.id`, `nsml.rule.confidence`, `nsml.source.uri`. Rule bodies that call AI agents emit child spans with OpenTelemetry gen-ai semantic-convention attributes (`gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`). The token tree *is* the trace tree.
+**Telemetry.** Each `commit` / `merge` is a span. Rule attributes go on the span: `nsml.rule.id`, `nsml.rule.confidence`, `nsml.source.uri`. Rule bodies that call AI agents emit child spans with OpenTelemetry gen-ai semantic-convention attributes (`gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`). The waypoint tree *is* the trace tree.
 
-**Lineage as provenance.** "Why does this target element exist?" is answered by walking parents from the token that produced it. The answer is structurally available, not reconstructed from logs. Every target element carries a reference (an EAnnotation, an EMF Adapter, or a side index) to the token whose rule firing produced it.
+**Lineage as provenance.** "Why does this target element exist?" is answered by walking parents from the waypoint that produced it. The answer is structurally available, not reconstructed from logs. Every target element carries a reference (an EAnnotation, an EMF Adapter, or a side index) to the waypoint whose rule firing produced it.
 
 ### 11.2 Worked sketch
 
 ```java
 // Engine startup
-var factory = new NsmlTokenFactory(targetResourceSet, openTelemetry);
-RealmStateToken<MappingStep, MappingContext> root = factory.root(
+var factory = new NsmlWaypointFactory(targetResourceSet, openTelemetry);
+RealmStateWaypoint<MappingStep, MappingContext> root = factory.root(
         new MappingStep(null, null),       // synthetic root step
         MappingContext.fresh());
 
 // A deterministic rule firing
 var step = new MappingStep(sourceEObject, rule);
-RealmStateToken<MappingStep, MappingContext> child = root.commit(step);
-child.execute((token, ctx) -> {
+RealmStateWaypoint<MappingStep, MappingContext> child = root.commit(step);
+child.execute(ctx -> {                       // closure captures `child`
     var targetEObject = rule.apply(sourceEObject, ctx);
     ctx.bind(sourceEObject, targetEObject);
-    ctx.annotateProvenance(targetEObject, token);
+    ctx.annotateProvenance(targetEObject, child);
 });
 
 // An AI-backed rule
-RealmStateToken<MappingStep, MappingContext> agentStep =
+RealmStateWaypoint<MappingStep, MappingContext> agentStep =
         child.commit(new MappingStep(otherSource, agentRule));
-agentStep.applyAsync((token, ctx) -> agent
+agentStep.applyAsync(ctx -> agent
         .chooseTargetConcept(otherSource, ctx)
-        .doOnNext(answer -> ctx.recordConfidence(token, answer.confidence()))
+        .doOnNext(answer -> ctx.recordConfidence(agentStep, answer.confidence()))
         .map(answer -> answer.targetConcept()))
     .subscribe(/* consumer */);
 
-// Retry on low confidence - sibling under the same parent, audit trail intact
-var lastAnswer = agentStep.<Answer>apply((t, ctx) -> ctx.lastAnswer(t));
+// Retry on low confidence — sibling under the same parent
+var lastAnswer = agentStep.<Answer>apply(ctx -> ctx.lastAnswer(agentStep));
 if (lastAnswer.confidence() < 0.6) {
     var retryStep = child.commit(
             new MappingStep(otherSource, agentRule.withHigherTemperature()));
@@ -572,81 +697,127 @@ if (lastAnswer.confidence() < 0.6) {
 
 ### 11.3 Why async + AI agents fit naturally
 
-Three properties of the token API matter for agentic rules, and all of them come from the core design rather than from special-purpose orchestration:
+Three properties of the waypoint API matter for agentic rules, and all of them come from the core design rather than from special-purpose orchestration:
 
 1. **Real asynchrony with backpressure.** `applyAsync` returns a cold `Mono`; agents are I/O-bound; fan-out (`Flux.merge`, `Flux.concatMap`) is governed by Reactor's standard backpressure mechanics.
-2. **Retry from a known-good state.** `pred.commit(retryStep)` snaps back to a known-good token. Retries with different prompts, temperatures, or models become siblings under the same parent. Nothing is lost from the audit trail - the rejected attempt remains in the token tree.
-3. **Observable cost and latency.** Per-step OTEL spans capture model, token usage, latency, cost. Aggregated across a mapping run, you get per-rule and total AI cost of producing the target model - which matters in production.
+2. **Retry from a known-good state.** `pred.commit(retryStep)` snaps back to a known-good waypoint. Retries with different prompts, temperatures, or models become siblings under the same parent. Nothing is lost from the audit trail — the rejected attempt remains in the waypoint tree.
+3. **Observable cost and latency.** Per-step OTEL spans capture model, token usage, latency, cost. Aggregated across a mapping run, you get per-rule and total AI cost of producing the target model — which matters in production.
 
-### 11.4 Declarative and agentic rules - uniform shape
+### 11.4 Declarative and agentic rules — uniform shape
 
-A deterministic NSML rule ("if source is `UMLClass`, create `OOPClass`") and an agentic rule ("ask the model to choose the best target concept given source and surrounding context") produce identical execution records - same lineage, same telemetry shape, same retry semantics. The only difference is in the rule body. That's a clean factoring you don't get if agent invocation is built into a special-purpose orchestrator: declarative and agentic transformations are no longer different kinds of system, just different rule bodies.
+A deterministic NSML rule ("if source is `UMLClass`, create `OOPClass`") and an agentic rule ("ask the model to choose the best target concept given source and surrounding context") produce identical execution records — same lineage, same telemetry shape, same retry semantics. The only difference is in the rule body. That's a clean factoring you don't get if agent invocation is built into a special-purpose orchestrator: declarative and agentic transformations are no longer different kinds of system, just different rule bodies.
 
 ### 11.5 Submodule sketch
 
 ```
-org.nasdanika.token.nsml
-+-- NsmlToken                       // alias for RealmStateToken<MappingStep, MappingContext>
-+-- NsmlTokenFactory                // root tokens, engine wiring, OTEL hookup
-+-- MappingStep                     // (sourceEObject, rule)
-+-- MappingContext                  // target ResourceSet + bindings + diagnostics
-+-- ProvenanceAnnotator             // links target elements to the producing token
-+-- agent
-    +-- AgentRule                    // base for AI-backed rules
-    +-- GenAiSpanAttributes          // OTEL gen-ai semantic-convention helpers
+org.nasdanika.waypoint.nsml
+├── NsmlWaypoint                    // alias for RealmStateWaypoint<MappingStep, MappingContext>
+├── NsmlWaypointFactory             // root waypoints, engine wiring, OTEL hookup
+├── MappingStep                     // (sourceEObject, rule)
+├── MappingContext                  // target ResourceSet + bindings + diagnostics
+├── ProvenanceAnnotator             // links target elements to the producing waypoint
+└── agent
+    ├── AgentRule                    // base for AI-backed rules
+    └── GenAiSpanAttributes          // OTEL gen-ai semantic-convention helpers
 ```
+
+### 11.6 NSML as a Realm adapter
+
+NSML transformations — and OpGraph mappings, and agentic semantic transformations more broadly — fit naturally as the adapter function passed to `Realm.adapt` / `Realm.adaptAsync`. The pattern is: you have a `Realm<S>` over some source representation; you want a `Realm<T>` view over a derived or semantic representation; the derivation is itself an NSML transformation that may be deterministic, async, or agentic.
+
+```java
+// Source realm: a guarded source model (EditingDomain, database connection,
+// in-memory model — anything realm-managed).
+Realm<SourceModel> sourceRealm = ...;
+
+// An NSML transformation, async because some rules are agentic.
+NsmlTransformation<SourceModel, TargetModel> transform = NsmlEngine.compile(rules);
+
+// Get a semantic view via the transformation. The transformation runs once
+// asynchronously; the resulting Realm<TargetModel> wraps that snapshot.
+Mono<Realm<TargetModel>> targetView =
+        sourceRealm.adaptAsync(transform::applyAsync);
+
+// Use the semantic view as if it were a real realm.
+targetView.flatMap(view ->
+        view.applyAsync(target -> downstream.process(target)))
+    .subscribe();
+```
+
+When the transformation is deterministic and cheap, the synchronous form works:
+
+```java
+Realm<TargetModel> liveView = sourceRealm.adapt(cheapTransform::apply);
+liveView.execute(target -> ...);   // re-applies the transformation per access
+```
+
+In practice almost any non-trivial NSML transformation — and certainly any agentic one — should use `adaptAsync`:
+
+- Re-running a substantive NSML transformation on every Realm access is expensive even when deterministic.
+- Re-running an agentic transformation is both expensive *and* non-deterministic — the agent may give a different answer on each invocation, which is rarely what the caller wants.
+- The NSML transformation's own execution is internally a `RealmStateWaypoint` chain (§11.1); snapshotting once gives you a single, complete, auditable execution record for the adaptation rather than a parade of partial records, one per access.
+
+This composes recursively. The snapshot `Realm<TargetModel>` returned by `adaptAsync` can itself be adapted further (e.g. a second NSML pass), used as the state for a `StateWaypoint` chain, or passed to a sub-engine. The NSML transformation that produced it is observable via OpenTelemetry, retryable via waypoint sibling branches (§11.3), and persistable via the Git submodule. At every layer, the semantic content of the source becomes a Realm.
+
+The general pattern — *NSML as a view definition language over realm-managed state* — is the strongest single argument for why `Realm` and `Waypoint` live in the same module. They are not merely composable; the combination is more interesting than either part alone, and the combination is what specialized engines (NSML, OpGraph, agentic semantic pipelines) actually need.
 
 ## 12. Rollback and retry
 
-The token graph itself is append-only; rollback is achieved by:
+The waypoint graph itself is append-only; rollback is achieved by:
 
-1. Locate a token at the desired pre-failure point (`pred`).
+1. Locate a waypoint at the desired pre-failure point (`pred`).
 2. Create a new child of `pred` for the retry: `pred.commit(retryElement)`.
-3. For `StateToken`, `pred.getState()` is the starting state for the retry.
-4. For `GitToken`, this maps to `git reset --hard <pred-commit>` and continuing.
-5. For `ChangeRecordingStateToken`, inverse-apply the `ChangeDescription`s back to `pred` before retrying.
+3. For `StateWaypoint`, `pred.getState()` is the starting state for the retry.
+4. For `GitWaypoint`, this maps to `git reset --hard <pred-commit>` and continuing.
+5. For `ChangeRecordingStateWaypoint`, inverse-apply the `ChangeDescription`s back to `pred` before retrying.
 
-Failure handling is deliberately *not* part of the core `Token<E>` interface - different traversal engines have different failure semantics (best-effort, transactional, compensating). They build on top of these primitives.
+Failure handling is deliberately *not* part of the core `Waypoint<E>` interface — different traversal engines have different failure semantics (best-effort, transactional, compensating). They build on top of these primitives.
 
 ## 13. Threading and reactive semantics
 
-- **Synchronous methods** (`commit`, `merge`, `map`, `execute`, `apply`) run on the caller's thread. Implementations that need a specific thread (e.g. EMF `EditingDomain` on the UI thread) document this and may block or dispatch.
-- **Asynchronous methods** (`*Async`, the `mapAsync` family) return a cold `Mono`. Nothing happens until subscription - matching Project Reactor convention.
-- **Backpressure:** a single token op is a single-value emission, so `Flux` doesn't appear here. Stream-of-tokens APIs (walkers, traversal engines) sit on top of this module and may use `Flux`.
+- **Synchronous methods** (`commit`, `merge`, `map`, `execute`, `apply`, `adapt`) run on the caller's thread. Implementations that need a specific thread (e.g. EMF `EditingDomain` on the UI thread) document this and may block or dispatch.
+- **Asynchronous methods** (`*Async`) return a cold `Mono`. Nothing happens until subscription — matching Project Reactor convention.
+- **Backpressure:** a single waypoint op is a single-value emission, so `Flux` doesn't appear here. Stream-of-waypoints APIs (walkers, traversal engines) sit on top of this module and may use `Flux`.
+- **Sync/async parity:** every operation that can be expressed in both modalities is expressed in both (§5.1). Implementations may share code between them; callers pick at the call site.
 
 ## 14. Open questions
 
-1. **Children tracking** - opt-in or always on? Always-on simplifies the API but retains memory for long-running traversals. *Recommendation: opt-in. `getChildren()` returns empty by default; `Tokens.withChildTracking(factory)` enables it.*
-2. **Identity** - `getId()` on the base interface, or only on `GitToken`? *Recommendation: optional `default Optional<String> getId() { return Optional.empty(); }`, overridden where meaningful.*
-3. **Equality** - reference equality, or `equals` by parents + element + id? *Recommendation: reference equality only, mirroring jGit (`RevCommit#equals` is identity-by-`ObjectId`).*
-4. **Walker / iterator API** - should the module ship a generic `TokenWalker` analogous to jGit's `RevWalk`? *Probably yes, but in a follow-up.*
-5. **Annotations / metadata** - open `Map<String,Object>` for ad-hoc decoration (timing, errors, tags)? *Recommendation: yes, on a small `Annotated` mixin or as a facet, not on the base interface.*
-6. **Cancellation** - should `executeAsync` / `mapAsync` propagate cancellation back to in-flight commands when the `Mono` is unsubscribed? *Recommendation: yes, by passing a `reactor.core.publisher.SignalType` listener or using `Disposable` hooks; details TBD per submodule.*
+1. **Children tracking** — opt-in or always on? Always-on simplifies the API but retains memory for long-running traversals. *Recommendation: opt-in. `getChildren()` returns empty by default; `Waypoints.withChildTracking(factory)` enables it.*
+2. **Identity** — `getId()` on the base interface, or only on `GitWaypoint`? *Recommendation: optional `default Optional<String> getId() { return Optional.empty(); }`, overridden where meaningful.*
+3. **Equality** — reference equality, or `equals` by parents + element + id? *Recommendation: reference equality only, mirroring jGit (`RevCommit#equals` is identity-by-`ObjectId`).*
+4. **Walker / iterator API** — should the module ship a generic `WaypointWalker` analogous to jGit's `RevWalk`? *Probably yes, but in a follow-up.*
+5. **Annotations / metadata** — open `Map<String,Object>` for ad-hoc decoration (timing, errors, tags)? *Recommendation: yes, on a small `Annotated` mixin or as a facet, not on the base interface.*
+6. **Cancellation** — should `executeAsync` / `mapAsync` propagate cancellation back to in-flight commands when the `Mono` is unsubscribed? *Recommendation: yes, by passing a `reactor.core.publisher.SignalType` listener or using `Disposable` hooks; details TBD per submodule.*
+7. **Realm adapt semantics — lens vs snapshot.** `adapt` is lens, `adaptAsync` is snapshot. *Documented in §6.3.1; the NSML-as-adapter use case (§11.6) confirms the choice for the async path — re-running an agentic transformation on every access is wrong. The remaining open question is whether we need a sync-snapshot variant for expensive but deterministic NSML transformations; conceivable, no confirmed call site yet. An async-lens variant has no confirmed use case at all.*
 
-## 15. Alignment with industry conventions - summary
+## 15. Alignment with industry conventions — summary
 
 | Concern              | Choice                                                                              |
 | -------------------- | ----------------------------------------------------------------------------------- |
-| Parent terminology   | `getParents()`, `getParent(int)`, `getParentCount()` - jGit `RevCommit`.            |
-| Append verbs         | `commit(E)`, `merge(E, parents)` - Git semantics, not `createChild`.                |
-| Collection types     | `List<? extends Token<E>>` for ordered parents; `Collection<? extends Token<E>>` for children. |
-| Variance             | `? super` on consumers, `? extends` on producers - `Stream` / `Collectors`.         |
-| Iteration parameter  | `Iterable<? extends Token<E>>` - accepts `List`, `Set`, `Collection`, custom.       |
+| Parent terminology   | `getParents()`, `getParent(int)`, `getParentCount()` — jGit `RevCommit`.            |
+| Append verbs         | `commit(E)`, `merge(E, parents)` — Git semantics, not `createChild`.                |
+| Collection types     | `List<? extends Waypoint<E>>` for ordered parents; `Collection<? extends Waypoint<E>>` for children. |
+| Variance             | `? super` on consumers, `? extends` on producers — `Stream` / `Collectors`.         |
+| Iteration parameter  | `Iterable<? extends Waypoint<E>>` — accepts `List`, `Set`, `Collection`, custom.    |
 | Varargs ergonomics   | Default method delegating to the `Iterable` overload; warning suppressed once.      |
-| Asynchronous return  | `Mono<T>` / `Mono<Void>` - Project Reactor.                                         |
-| Mapper signatures    | `Function<? super X, ? extends Y>` - `Stream#map` convention.                       |
-| `AutoCloseable`      | On `TelemetryToken` for try-with-resources span lifecycle.                          |
-| Editing-domain idiom | `execute(BiConsumer)` / `apply(BiFunction)` - JFace `Realm`, EMF `EditingDomain`, Vert.x `Context#runOnContext`. |
+| Sync/async parity    | One interface, two modalities; async methods suffixed `Async` — Azure OpenAI Java SDK convention. |
+| Asynchronous return  | `Mono<T>` / `Mono<Void>` — Project Reactor.                                         |
+| Mapper signatures    | `Function<? super X, ? extends Y>` — `Stream#map` convention.                       |
+| `AutoCloseable`      | On `TelemetryWaypoint` for try-with-resources span lifecycle.                       |
+| Realm idiom          | `execute(Consumer)` / `apply(Function)` — JFace `Realm`, EMF `EditingDomain`, Vert.x `Context#runOnContext`. Closure-capture replaces BiConsumer-style overloads. |
 
 ## 16. Backwards compatibility / migration
 
-Greenfield - nothing to migrate. The existing `org.nasdanika.graph.message` package stays as-is; an adapter in `org.nasdanika.token.graph` will let traversal engines emit tokens that also produce messages where useful.
+`Realm`, `ExclusiveRealm`, and `ReadWriteRealm` move from `org.nasdanika.common` to `org.nasdanika.waypoint`. They were experimental, so no stable consumers should exist; nonetheless, the migration is a package rename plus the addition of async methods and `adapt` / `adaptAsync`. Existing implementations need to provide the new methods (mostly mechanical) or extend an abstract base class that supplies sensible defaults.
+
+The existing `org.nasdanika.graph.message` package stays as-is; an adapter in `org.nasdanika.waypoint.graph` will let traversal engines emit waypoints that also produce messages where useful.
 
 ## 17. Next steps
 
-1. Create `org.nasdanika.token` module skeleton (Maven coordinates, `module-info.java`, package layout).
-2. Implement the reference `Token<E>` and `StateToken<E, S>` with in-memory, opt-in child tracking.
-3. Port the OpGraph execution PoC to `StateToken`.
-4. Spike `GitToken` against jGit to validate rollback semantics on a real repository.
-5. Spike the NSML integration (-11) against a real mapping - both a deterministic rule and an agent-backed rule - to validate the `RealmStateToken` + telemetry shape end-to-end.
-6. Decide -14 open questions - particularly identity, child-tracking default, and walker API - before stabilising the API.
+1. Create `org.nasdanika.waypoint` module skeleton (Maven coordinates, `module-info.java`, package layout).
+2. Move `Realm`, `ExclusiveRealm`, `ReadWriteRealm` from `org.nasdanika.common`, add async methods and `adapt` / `adaptAsync`.
+3. Implement the reference `Waypoint<E>` and `StateWaypoint<E, S>` with in-memory, opt-in child tracking.
+4. Port the OpGraph execution PoC to `StateWaypoint`.
+5. Spike `GitWaypoint` against jGit to validate rollback semantics on a real repository.
+6. Spike the NSML integration (§11) against a real mapping — both a deterministic rule and an agent-backed rule — to validate the `RealmStateWaypoint` + telemetry shape end-to-end.
+7. Decide §14 open questions — particularly identity, child-tracking default, walker API, and lens vs snapshot semantics for async `adapt` — before stabilising the API.
