@@ -131,7 +131,7 @@ public interface Waypoint<E> {
 
     /**
      * Children of this waypoint. May be empty if the implementation does
-     * not track children (which is the default — see §14 Open Questions).
+     * not track children (which is the default — see §15 Open Questions).
      * Unlike Git commits, we expose children because the typical
      * traversal-time use case reads them forward.
      */
@@ -773,14 +773,55 @@ The waypoint graph itself is append-only; rollback is achieved by:
 
 Failure handling is deliberately *not* part of the core `Waypoint<E>` interface — different traversal engines have different failure semantics (best-effort, transactional, compensating). They build on top of these primitives.
 
-## 13. Threading and reactive semantics
+## 13. Memory tiers, checkpointing, and durability for agents
+
+Agent architecture distinguishes **hot memory** — the fast, volatile working state an agent reads and writes on every step — from **cold memory** — the durable, slower store used for recovery, audit, and resumption. Waypoint expresses this not as two subsystems but as a single continuum selected by configuration: the agent code that issues `commit` / `merge` / `execute` / `apply` is identical whether its state lives only in RAM or is committed to Git and replicated to a remote. This section makes that mapping explicit; nothing here is new mechanism, only a naming of what §10 and §12 already provide.
+
+### 13.1 The hot↔cold switch is configuration, not code
+
+A traversal's durability is fixed by which `WaypointFactory` (§9) it is rooted with — the agent never sees the difference:
+
+| Configuration                                            | Tier              | What it buys                                                                 |
+| -------------------------------------------------------- | ----------------- | ---------------------------------------------------------------------------- |
+| In-memory `StateWaypoint` / `RealmWaypoint`              | **Hot**           | Lowest latency working state; lost on process exit.                          |
+| EMF `ResourceSet`, unsaved (§10.3)                       | **Hot** (structured) | Hot, but with change recording and realm discipline already in place.     |
+| EMF resource saved to the working tree                   | **Warm**          | Survives a crash; no curated history, no rollback points.                    |
+| `GitWaypoint` commit, local repository (§10.2)           | **Cold (local)**  | Immutable, content-addressed checkpoint; branch, merge, reset.               |
+| `GitWaypoint` with one or more remotes pushed            | **Cold (remote)** | Offsite redundancy; survives loss of the local machine.                      |
+
+Pure in-memory is hot. A file-backed repository is cold-local. A file-backed repository **with** a remote gives two distinct levels of coldness — local and remote — directly analogous to the redundancy/replication tiers of a cloud object store. Promoting an agent from hot to cold, or adding a second cold tier, is a factory swap and a remote configuration; the lineage, telemetry, and state APIs are unchanged.
+
+### 13.2 Checkpoints are commits
+
+Every waypoint is a checkpoint. With the Git backend it is literally a `RevCommit` (§10.2). This is the role LangGraph's checkpointer plays (§3.1) — but here the checkpoint is content-addressed, carries parents, and supports branch / merge / reset as native operations. As a result, **checkpoint**, **rollback** (§12), and **fork-for-retry** (§11.3) are not three bespoke mechanisms but the same Git primitives viewed from different angles. "Resume the agent from checkpoint X" is `WaypointFactory#root(elementAt(X))` (§9) — root a new traversal at that commit and continue.
+
+### 13.3 Per-resource granularity with EMF
+
+With the EMF backend (§10.3, §10.4) the hot/cold decision is **per resource**, not per agent. A `ResourceSet` holds many `Resource`s, and each can be configured independently — kept in memory only (hot), saved each step (warm), committed (cold-local), or pushed (cold-remote). An agent can therefore keep its scratch and working set hot while durably checkpointing only the resources that matter, all transparently: the agent only ever issues commands against the realm and is unaware which resources are persisted where. This is finer-grained than an all-or-nothing checkpointer, which forces one durability policy on the entire state.
+
+### 13.4 The checkpoint ladder
+
+EMF resources over Git/jGit yield a graded ladder of durability, each rung a distinct, individually addressable checkpoint level:
+
+1. **In-memory mutation** (hottest) — captured by `ChangeRecorder` as a `ChangeDescription`; reversible in-process via inverse-apply (§10.3).
+2. **Saved resource** — serialized to the working tree; survives process crash.
+3. **Committed change** — a `RevCommit`; immutable, part of history, rollback via `reset` / `revert`.
+4. **Pushed change** (coldest) — replicated to one or more remotes; offsite durability.
+
+Recovery selects the appropriate rung rather than always paying for the coldest: inverse-apply a `ChangeDescription` (1), reload a resource (2), reset to a commit (3), or fetch from a remote (4).
+
+### 13.5 Troubleshooting at trace/span level, not log level
+
+Because each `commit` / `merge` is an OpenTelemetry span (§6.5, §10.1) and each step records a `ChangeDescription` (§10.3), agent troubleshooting happens at **trace/span granularity** with change records — and ordinary logs — attached as span events and attributes, rather than by grepping a flat log stream. For any step you have, in one place: the span (rule id, model, token usage, latency, confidence), the exact state delta that step produced (the `ChangeDescription`), and the lineage that led to it (parents). This is strictly finer-grained and more directly actionable than log-level debugging — you can replay or inverse-apply the precise change a step made instead of inferring it from log lines. The waypoint tree *is* the trace tree (§11.1), and each node carries its own reversible diff.
+
+## 14. Threading and reactive semantics
 
 - **Synchronous methods** (`commit`, `merge`, `map`, `execute`, `apply`, `adapt`) run on the caller's thread. Implementations that need a specific thread (e.g. EMF `EditingDomain` on the UI thread) document this and may block or dispatch.
 - **Asynchronous methods** (`*Async`) return a cold `Mono`. Nothing happens until subscription — matching Project Reactor convention.
 - **Backpressure:** a single waypoint op is a single-value emission, so `Flux` doesn't appear here. Stream-of-waypoints APIs (walkers, traversal engines) sit on top of this module and may use `Flux`.
 - **Sync/async parity:** every operation that can be expressed in both modalities is expressed in both (§5.1). Implementations may share code between them; callers pick at the call site.
 
-## 14. Open questions
+## 15. Open questions
 
 1. **Children tracking** — opt-in or always on? Always-on simplifies the API but retains memory for long-running traversals. *Recommendation: opt-in. `getChildren()` returns empty by default; `Waypoints.withChildTracking(factory)` enables it.*
 2. **Identity** — `getId()` on the base interface, or only on `GitWaypoint`? *Recommendation: optional `default Optional<String> getId() { return Optional.empty(); }`, overridden where meaningful.*
@@ -790,7 +831,7 @@ Failure handling is deliberately *not* part of the core `Waypoint<E>` interface 
 6. **Cancellation** — should `executeAsync` / `mapAsync` propagate cancellation back to in-flight commands when the `Mono` is unsubscribed? *Recommendation: yes, by passing a `reactor.core.publisher.SignalType` listener or using `Disposable` hooks; details TBD per submodule.*
 7. **Realm adapt semantics — lens vs snapshot.** `adapt` is lens, `adaptAsync` is snapshot. *Documented in §6.3.1; the NSML-as-adapter use case (§11.6) confirms the choice for the async path — re-running an agentic transformation on every access is wrong. The remaining open question is whether we need a sync-snapshot variant for expensive but deterministic NSML transformations; conceivable, no confirmed call site yet. An async-lens variant has no confirmed use case at all.*
 
-## 15. Alignment with industry conventions — summary
+## 16. Alignment with industry conventions — summary
 
 | Concern              | Choice                                                                              |
 | -------------------- | ----------------------------------------------------------------------------------- |
@@ -806,13 +847,13 @@ Failure handling is deliberately *not* part of the core `Waypoint<E>` interface 
 | `AutoCloseable`      | On `TelemetryWaypoint` for try-with-resources span lifecycle.                       |
 | Realm idiom          | `execute(Consumer)` / `apply(Function)` — JFace `Realm`, EMF `EditingDomain`, Vert.x `Context#runOnContext`. Closure-capture replaces BiConsumer-style overloads. |
 
-## 16. Backwards compatibility / migration
+## 17. Backwards compatibility / migration
 
 `Realm`, `ExclusiveRealm`, and `ReadWriteRealm` move from `org.nasdanika.common` to `org.nasdanika.waypoint`. They were experimental, so no stable consumers should exist; nonetheless, the migration is a package rename plus the addition of async methods and `adapt` / `adaptAsync`. Existing implementations need to provide the new methods (mostly mechanical) or extend an abstract base class that supplies sensible defaults.
 
 The existing `org.nasdanika.graph.message` package stays as-is; an adapter in `org.nasdanika.waypoint.graph` will let traversal engines emit waypoints that also produce messages where useful.
 
-## 17. Next steps
+## 18. Next steps
 
 1. Create `org.nasdanika.waypoint` module skeleton (Maven coordinates, `module-info.java`, package layout).
 2. Move `Realm`, `ExclusiveRealm`, `ReadWriteRealm` from `org.nasdanika.common`, add async methods and `adapt` / `adaptAsync`.
@@ -820,4 +861,4 @@ The existing `org.nasdanika.graph.message` package stays as-is; an adapter in `o
 4. Port the OpGraph execution PoC to `StateWaypoint`.
 5. Spike `GitWaypoint` against jGit to validate rollback semantics on a real repository.
 6. Spike the NSML integration (§11) against a real mapping — both a deterministic rule and an agent-backed rule — to validate the `RealmStateWaypoint` + telemetry shape end-to-end.
-7. Decide §14 open questions — particularly identity, child-tracking default, walker API, and lens vs snapshot semantics for async `adapt` — before stabilising the API.
+7. Decide §15 open questions — particularly identity, child-tracking default, walker API, and lens vs snapshot semantics for async `adapt` — before stabilising the API.
