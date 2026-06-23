@@ -920,6 +920,26 @@ diff between a parent's state and its child's.
    "Inform and ask for confirmation" and "request elaboration" are the same
    mechanism with different commit-message payloads.
 
+**Back-pressure and preferences.** The escalation channel of step 4 is rate-
+limited by the recipient, not by the loop. Per-persona preferences — opt-out of
+proactive building, opt-out of elaboration requests, a maximum request rate
+("one per week"), and a cap on concurrent outstanding requests — are part of the
+threaded state `S`, so the readiness mapper (step 2) can see them: a candidate
+whose only path forward is an escalation the recipient will not accept is *not
+ready*, exactly as if a prerequisite were missing. This is reactive-streams
+back-pressure applied to human attention — demand is signalled by the consumer,
+and the producer (the agent) throttles to match. The §14 timeout closes the
+loop on unanswered requests: the escalation waypoint's commit message carries a
+deadline and a timeout action, and on expiry the timeout commit releases the
+candidate rather than leaving the branch suspended indefinitely. When a branch
+is blocked — opted out, throttled, or timed out — the agent does not idle; the
+next `select` (step 1) simply commits at the best *reachable* candidate instead.
+If Joe's branch is unavailable, Jane's lower-priority capability is built,
+because selection ranks by value-per-reachable-step, not by nominal priority
+alone. The art of the possible falls out of the geometry: an unreachable branch
+contributes no children, so the frontier the loop advances is always the one it
+can actually move.
+
 **Unlock as DAG geometry.** A successful act in step 3 changes the readiness of
 *downstream* steps — a delivered dependency flips a prerequisite to Available —
 so the next selection re-evaluates a frontier the previous commit reshaped. When
