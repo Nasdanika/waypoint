@@ -131,7 +131,7 @@ public interface Waypoint<E> {
 
     /**
      * Children of this waypoint. May be empty if the implementation does
-     * not track children (which is the default — see §15 Open Questions).
+     * not track children (which is the default — see §16 Open Questions).
      * Unlike Git commits, we expose children because the typical
      * traversal-time use case reads them forward.
      */
@@ -814,14 +814,62 @@ Recovery selects the appropriate rung rather than always paying for the coldest:
 
 Because each `commit` / `merge` is an OpenTelemetry span (§6.5, §10.1) and each step records a `ChangeDescription` (§10.3), agent troubleshooting happens at **trace/span granularity** with change records — and ordinary logs — attached as span events and attributes, rather than by grepping a flat log stream. For any step you have, in one place: the span (rule id, model, token usage, latency, confidence), the exact state delta that step produced (the `ChangeDescription`), and the lineage that led to it (parents). This is strictly finer-grained and more directly actionable than log-level debugging — you can replay or inverse-apply the precise change a step made instead of inferring it from log lines. The waypoint tree *is* the trace tree (§11.1), and each node carries its own reversible diff.
 
-## 14. Threading and reactive semantics
+## 14. Asynchronous escalation and human-in-the-loop
+
+A distinctive use of the Git backend (§10.2): **a commit is an escalation.** When an agent reaches a point that needs a human decision — approval, disambiguation, authorization, or a low-confidence rule result (§11.3) — it commits a waypoint whose **tree carries the model state** and whose **commit message carries the execution state of the escalation**: who it escalates to, the deadline, the follow-up cadence, and the action to take on timeout. The commit is the durable, asynchronous hand-off point; the agent process is then free to exit. Resolution arrives later as a further commit, produced either by a human or by an automated timeout action.
+
+This is the human-in-the-loop / interrupt pattern (LangGraph interrupts, Temporal signals — §3.1) realized entirely with Git's native infrastructure — commits, hooks, and server-side actions — rather than a bespoke pause/resume engine.
+
+### 14.1 What goes where
+
+- **Tree (model state).** The waypoint's `S` state, serialized into the repository. When `S` is an EMF model the serialization is trivial and worth doing as **YAML** — human- and machine-readable — so the human reviewing the escalation reads an ordinary Git diff of the model, and the engine reads it back with no custom codec.
+- **Commit message (escalation execution state).** The control metadata. Git commit messages have no practical size limit (some forges cap display/storage around 5 MB), so even a verbose escalation prompt with embedded context fits comfortably. Structured fields belong in **Git trailers** (`Key: Value` lines, the same convention as `Co-Authored-By` / `Signed-off-by`), which are trivially parseable while the free-form body stays human-readable:
+
+```
+Escalate: target concept ambiguous for source acme:Order
+
+Rule `order-mapping` returned confidence 0.42 (threshold 0.60).
+Two candidate target concepts: sales:Order, fulfillment:Shipment.
+Please choose, or supply a correction.
+
+Waypoint-Escalation: required
+Escalation-To: data-stewards@example.com, alice@example.com
+Escalation-Mode: group
+Escalation-Deadline: 2026-06-25T17:00:00Z
+Escalation-Followup: PT4H
+Escalation-On-Timeout: pick-highest-confidence
+Waypoint-Id: 3f9a1c…
+```
+
+### 14.2 The hook / action
+
+A repository hook or forge action fires on the escalation commit and owns the out-of-band lifecycle:
+
+1. **Detect.** Triggered on the commit — a server-side `post-receive` hook or a forge action (GitHub Actions, GitLab webhook) on push. Server-side rather than local `post-commit`, because the escalation and its timers must outlive the agent process. This lands the escalation naturally at the **cold-remote tier (§13)** — where durability and out-of-band integrations belong.
+2. **Notify.** Parse the trailers; contact the target(s). `Escalation-Mode: group` fans out to several humans.
+3. **Schedule.** Register timer jobs keyed by `Waypoint-Id` — one per `Escalation-Followup` interval (reminders) and one at `Escalation-Deadline` (the timeout action). The commit id makes the jobs idempotent.
+
+### 14.3 Resolution is another commit
+
+Both outcomes converge on the same primitive — a child commit of the escalation waypoint:
+
+- **Human responds.** The decision (chosen concept, correction, approval token) is written as a child commit; the engine resumes by rooting a new traversal there (§9). A group escalation resolves on first authoritative response, or on quorum, with later responses recorded as additional merge parents (§6.1) for the audit trail.
+- **Deadline passes.** The timeout job applies `Escalation-On-Timeout` as an automated child commit — e.g. `pick-highest-confidence`, `abort`, or `escalate-to <next>`. The agent's later resumption cannot tell a human resolution from an automated one; both are simply the next waypoint.
+
+Because the unresolved state remains in the graph, escalation inherits the same auditability and retry semantics as everything else (§11.3, §12): nothing is mutated in place; the escalation, its reminders, and its resolution are all durable, content-addressed waypoints.
+
+### 14.4 Assessment
+
+The fit is good and the core needs no changes — escalation is an application pattern over `GitWaypoint` plus conventions, not a new interface. It is worth building as a thin helper in (or alongside) `org.nasdanika.waypoint.git`: an `EscalationTrailers` parser/writer, a reference `post-receive` hook, and a pluggable `Notifier` / `Scheduler` SPI so the timer and messaging backends (cron, a forge's scheduled workflows, a durable queue, email / Slack) are swappable. The one real design caveat is the timer: Git has no native scheduler, so follow-ups and timeouts depend on an external durable scheduler keyed by commit id — that component, not Git, is the source of truth for "has this escalation timed out."
+
+## 15. Threading and reactive semantics
 
 - **Synchronous methods** (`commit`, `merge`, `map`, `execute`, `apply`, `adapt`) run on the caller's thread. Implementations that need a specific thread (e.g. EMF `EditingDomain` on the UI thread) document this and may block or dispatch.
 - **Asynchronous methods** (`*Async`) return a cold `Mono`. Nothing happens until subscription — matching Project Reactor convention.
 - **Backpressure:** a single waypoint op is a single-value emission, so `Flux` doesn't appear here. Stream-of-waypoints APIs (walkers, traversal engines) sit on top of this module and may use `Flux`.
 - **Sync/async parity:** every operation that can be expressed in both modalities is expressed in both (§5.1). Implementations may share code between them; callers pick at the call site.
 
-## 15. Open questions
+## 16. Open questions
 
 1. **Children tracking** — opt-in or always on? Always-on simplifies the API but retains memory for long-running traversals. *Recommendation: opt-in. `getChildren()` returns empty by default; `Waypoints.withChildTracking(factory)` enables it.*
 2. **Identity** — `getId()` on the base interface, or only on `GitWaypoint`? *Recommendation: optional `default Optional<String> getId() { return Optional.empty(); }`, overridden where meaningful.*
@@ -831,7 +879,7 @@ Because each `commit` / `merge` is an OpenTelemetry span (§6.5, §10.1) and eac
 6. **Cancellation** — should `executeAsync` / `mapAsync` propagate cancellation back to in-flight commands when the `Mono` is unsubscribed? *Recommendation: yes, by passing a `reactor.core.publisher.SignalType` listener or using `Disposable` hooks; details TBD per submodule.*
 7. **Realm adapt semantics — lens vs snapshot.** `adapt` is lens, `adaptAsync` is snapshot. *Documented in §6.3.1; the NSML-as-adapter use case (§11.6) confirms the choice for the async path — re-running an agentic transformation on every access is wrong. The remaining open question is whether we need a sync-snapshot variant for expensive but deterministic NSML transformations; conceivable, no confirmed call site yet. An async-lens variant has no confirmed use case at all.*
 
-## 16. Alignment with industry conventions — summary
+## 17. Alignment with industry conventions — summary
 
 | Concern              | Choice                                                                              |
 | -------------------- | ----------------------------------------------------------------------------------- |
@@ -847,13 +895,13 @@ Because each `commit` / `merge` is an OpenTelemetry span (§6.5, §10.1) and eac
 | `AutoCloseable`      | On `TelemetryWaypoint` for try-with-resources span lifecycle.                       |
 | Realm idiom          | `execute(Consumer)` / `apply(Function)` — JFace `Realm`, EMF `EditingDomain`, Vert.x `Context#runOnContext`. Closure-capture replaces BiConsumer-style overloads. |
 
-## 17. Backwards compatibility / migration
+## 18. Backwards compatibility / migration
 
 `Realm`, `ExclusiveRealm`, and `ReadWriteRealm` move from `org.nasdanika.common` to `org.nasdanika.waypoint`. They were experimental, so no stable consumers should exist; nonetheless, the migration is a package rename plus the addition of async methods and `adapt` / `adaptAsync`. Existing implementations need to provide the new methods (mostly mechanical) or extend an abstract base class that supplies sensible defaults.
 
 The existing `org.nasdanika.graph.message` package stays as-is; an adapter in `org.nasdanika.waypoint.graph` will let traversal engines emit waypoints that also produce messages where useful.
 
-## 18. Next steps
+## 19. Next steps
 
 1. Create `org.nasdanika.waypoint` module skeleton (Maven coordinates, `module-info.java`, package layout).
 2. Move `Realm`, `ExclusiveRealm`, `ReadWriteRealm` from `org.nasdanika.common`, add async methods and `adapt` / `adaptAsync`.
@@ -861,4 +909,5 @@ The existing `org.nasdanika.graph.message` package stays as-is; an adapter in `o
 4. Port the OpGraph execution PoC to `StateWaypoint`.
 5. Spike `GitWaypoint` against jGit to validate rollback semantics on a real repository.
 6. Spike the NSML integration (§11) against a real mapping — both a deterministic rule and an agent-backed rule — to validate the `RealmStateWaypoint` + telemetry shape end-to-end.
-7. Decide §15 open questions — particularly identity, child-tracking default, walker API, and lens vs snapshot semantics for async `adapt` — before stabilising the API.
+7. Decide §16 open questions — particularly identity, child-tracking default, walker API, and lens vs snapshot semantics for async `adapt` — before stabilising the API.
+8. Spike the asynchronous-escalation pattern (§14) — `EscalationTrailers`, a `post-receive` hook, and a `Notifier` / `Scheduler` SPI — against a real low-confidence rule, to validate the commit-as-escalation hand-off end to end.
