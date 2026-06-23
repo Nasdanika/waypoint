@@ -615,6 +615,18 @@ public final class GitWaypointFactory<E, S>
 }
 ```
 
+#### Trace-context propagation — weaving Git into the larger trace
+
+Beyond serializing element and state, each `GitWaypoint` commit carries the **OpenTelemetry trace context** of the span that produced it, recorded as commit trailers in the W3C Trace Context format (`traceparent`, `tracestate`). The commit's trailer block is just another `TextMapPropagator` carrier — the same mechanism §10.1 uses for HTTP headers and message attributes — so injection on commit and extraction on read reuse the OpenTelemetry SDK rather than a bespoke encoding:
+
+```
+Waypoint-Id: 3f9a1c…
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+tracestate: nsml=rule:order-mapping
+```
+
+This unifies the Git-persisted execution with the wider distributed trace. A commit written under span S records S's `traceparent`; any process that later reads the commit — to resume after an escalation (§14), to replay, or for forensic analysis — extracts that context and creates its spans as children or links of S. The trace therefore spans not just process and machine boundaries but **time**: the in-memory `TelemetryWaypoint` spans (§6.5), the upstream distributed trace, and the durable Git history all share trace and span ids, so an observability backend shows one continuous trace from the originating request, across the cold gap of a human-in-the-loop pause (§14), to final completion. Merge commits carry one `traceparent` per parent as span links — the same primary-parent / `addLink` split as §10.1 — so the commit DAG and the trace DAG reinforce rather than duplicate each other. The recorded trace and span ids also double as a join key in both directions: pivot from a commit in the repository to its trace in the observability backend, and from a span back to the commit that persisted it.
+
 ### 10.3 `org.nasdanika.waypoint.emf`
 
 Bridges to EMF `ResourceSet` / `Resource`:
@@ -839,7 +851,10 @@ Escalation-Deadline: 2026-06-25T17:00:00Z
 Escalation-Followup: PT4H
 Escalation-On-Timeout: pick-highest-confidence
 Waypoint-Id: 3f9a1c…
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
 ```
+
+The `traceparent` trailer (§10.2) rides alongside the escalation fields, so the trace survives the cold gap: whoever resolves the escalation — human or timeout job — re-parents its spans under the original trace, and the observability backend shows the whole episode, from the agent's pause to the resolution, as one continuous trace.
 
 ### 14.2 The hook / action
 
