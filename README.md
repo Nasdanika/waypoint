@@ -877,14 +877,76 @@ Because the unresolved state remains in the graph, escalation inherits the same 
 
 The fit is good and the core needs no changes — escalation is an application pattern over `GitWaypoint` plus conventions, not a new interface. It is worth building as a thin helper in (or alongside) `org.nasdanika.waypoint.git`: an `EscalationTrailers` parser/writer, a reference `post-receive` hook, and a pluggable `Notifier` / `Scheduler` SPI so the timer and messaging backends (cron, a forge's scheduled workflows, a durable queue, email / Slack) are swappable. The one real design caveat is the timer: Git has no native scheduler, so follow-ups and timeouts depend on an external durable scheduler keyed by commit id — that component, not Git, is the source of truth for "has this escalation timed out."
 
-## 15. Threading and reactive semantics
+## 15. Case study: budget-bounded proactive construction
+
+This case study composes the primitives above — the lineage DAG (§6), state
+threading (§7, §11), guarded state (Core interfaces), durability and
+checkpointing (§13), and asynchronous escalation (§14) — into an autonomous
+build loop that runs a *commit → evaluate-if-enough-input → act* pattern against
+an external model of intent. The worked source of intent is a
+[Nasdanika Product Management model](https://product-management.models.nasdanika.org/)
+(persona → concern → capability → capability provider), but any typed source of
+requirements instantiates `E` the same way.
+
+**Positioning.** The element type `E` is a build step — a
+`(Capability, ProviderTemplate)` pair drawn from the intent model. The threaded
+state `S` carries two things: the accumulated inputs for the step (requirements,
+design, available prerequisites) and a running **budget ledger** (remaining
+spend for the period). Because state is read-only from a waypoint's perspective
+and transformations produce *new* waypoints (§7), the ledger is auditable by
+construction: every act that consumes budget is a commit, and the spend is the
+diff between a parent's state and its child's.
+
+**The loop.**
+
+1. **Select — `commit`.** A traversal over the intent graph commits a waypoint at
+   the highest-value capability whose provider does not yet exist, prioritized
+   persona → concern → capability. An ordinary fast-forward `commit(E next)`.
+2. **Evaluate — `map` / `applyAsync`.** A mapper computes readiness from the
+   accumulated state: are requirements and design present, are prerequisite
+   capabilities Available, is the remaining budget sufficient for the estimated
+   cost? Readiness is "the mapper can execute" — no separate guard construct.
+3. **Act — guarded `commit`.** If ready, the agent generates the capability
+   provider and applies the model edit, the artifact write, and the budget
+   decrement through a `RealmWaypoint` so they share one transactional boundary
+   (undo recording, invariants). It then commits a child waypoint recording the
+   new provider, its provenance, and the spend.
+4. **Escalate — async, §14.** If under-specified, the agent does *not* guess. It
+   commits a waypoint whose commit message carries the §14 escalation metadata —
+   recipient (the persona who holds the unmet concern), the specific input
+   needed, a deadline, and a timeout action — and suspends the branch. It resumes
+   when a child commit is created: by the human elaborating the design, or by the
+   timeout policy (shelve, notify, or proceed on a conservative default).
+   "Inform and ask for confirmation" and "request elaboration" are the same
+   mechanism with different commit-message payloads.
+
+**Unlock as DAG geometry.** A successful act in step 3 changes the readiness of
+*downstream* steps — a delivered dependency flips a prerequisite to Available —
+so the next selection re-evaluates a frontier the previous commit reshaped. When
+Jim's build of provider A (a SQL AST loader) lowers the bar for a capability
+whose concern Joe holds, step 2 finds it newly close to ready but
+under-specified, and step 4 routes an elaboration request to Joe. The
+cross-author handoff is a join (§6 multi-parent waypoints): Joe's elaboration
+commit and the agent's suspended branch `merge` into the waypoint from which
+construction continues. Conditional flow, retry, and human-in-the-loop are
+expressed as waypoint geometry rather than as control constructs — the same
+property the NSML case study (§11) relies on.
+
+**Why it is safe to run unattended.** Durability and checkpointing (§13) let the
+loop survive process restarts across a month-long budget window — the lineage
+*is* the checkpoint, so a crash resumes from the last commit rather than
+re-spending. And because the agent traverses an access-controlled view of the
+intent model, "what may this agent build, and for whom" is a property of the
+produced view, not something the loop must be trusted to enforce.
+
+## 16. Threading and reactive semantics
 
 - **Synchronous methods** (`commit`, `merge`, `map`, `execute`, `apply`, `adapt`) run on the caller's thread. Implementations that need a specific thread (e.g. EMF `EditingDomain` on the UI thread) document this and may block or dispatch.
 - **Asynchronous methods** (`*Async`) return a cold `Mono`. Nothing happens until subscription — matching Project Reactor convention.
 - **Backpressure:** a single waypoint op is a single-value emission, so `Flux` doesn't appear here. Stream-of-waypoints APIs (walkers, traversal engines) sit on top of this module and may use `Flux`.
 - **Sync/async parity:** every operation that can be expressed in both modalities is expressed in both (§5.1). Implementations may share code between them; callers pick at the call site.
 
-## 16. Open questions
+## 17. Open questions
 
 1. **Children tracking** — opt-in or always on? Always-on simplifies the API but retains memory for long-running traversals. *Recommendation: opt-in. `getChildren()` returns empty by default; `Waypoints.withChildTracking(factory)` enables it.*
 2. **Identity** — `getId()` on the base interface, or only on `GitWaypoint`? *Recommendation: optional `default Optional<String> getId() { return Optional.empty(); }`, overridden where meaningful.*
@@ -894,7 +956,7 @@ The fit is good and the core needs no changes — escalation is an application p
 6. **Cancellation** — should `executeAsync` / `mapAsync` propagate cancellation back to in-flight commands when the `Mono` is unsubscribed? *Recommendation: yes, by passing a `reactor.core.publisher.SignalType` listener or using `Disposable` hooks; details TBD per submodule.*
 7. **Realm adapt semantics — lens vs snapshot.** `adapt` is lens, `adaptAsync` is snapshot. *Documented in §6.3.1; the NSML-as-adapter use case (§11.6) confirms the choice for the async path — re-running an agentic transformation on every access is wrong. The remaining open question is whether we need a sync-snapshot variant for expensive but deterministic NSML transformations; conceivable, no confirmed call site yet. An async-lens variant has no confirmed use case at all.*
 
-## 17. Alignment with industry conventions — summary
+## 18. Alignment with industry conventions — summary
 
 | Concern              | Choice                                                                              |
 | -------------------- | ----------------------------------------------------------------------------------- |
@@ -910,13 +972,13 @@ The fit is good and the core needs no changes — escalation is an application p
 | `AutoCloseable`      | On `TelemetryWaypoint` for try-with-resources span lifecycle.                       |
 | Realm idiom          | `execute(Consumer)` / `apply(Function)` — JFace `Realm`, EMF `EditingDomain`, Vert.x `Context#runOnContext`. Closure-capture replaces BiConsumer-style overloads. |
 
-## 18. Backwards compatibility / migration
+## 19. Backwards compatibility / migration
 
 `Realm`, `ExclusiveRealm`, and `ReadWriteRealm` move from `org.nasdanika.common` to `org.nasdanika.waypoint`. They were experimental, so no stable consumers should exist; nonetheless, the migration is a package rename plus the addition of async methods and `adapt` / `adaptAsync`. Existing implementations need to provide the new methods (mostly mechanical) or extend an abstract base class that supplies sensible defaults.
 
 The existing `org.nasdanika.graph.message` package stays as-is; an adapter in `org.nasdanika.waypoint.graph` will let traversal engines emit waypoints that also produce messages where useful.
 
-## 19. Next steps
+## 20. Next steps
 
 1. Create `org.nasdanika.waypoint` module skeleton (Maven coordinates, `module-info.java`, package layout).
 2. Move `Realm`, `ExclusiveRealm`, `ReadWriteRealm` from `org.nasdanika.common`, add async methods and `adapt` / `adaptAsync`.
